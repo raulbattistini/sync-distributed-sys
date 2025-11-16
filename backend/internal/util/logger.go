@@ -12,6 +12,7 @@ const (
 	DEBUG LogLevel = iota
 	INFO
 	WARN
+	FATAL
 	ERROR
 )
 
@@ -19,6 +20,7 @@ var stringToLevel = map[string]LogLevel{
 	"DEBUG": DEBUG,
 	"INFO":  INFO,
 	"WARN":  WARN,
+	"FATAL": FATAL,
 	"ERROR": ERROR,
 }
 
@@ -26,6 +28,7 @@ var levelToString = map[LogLevel]string{
 	DEBUG: "DEBUG",
 	INFO:  "INFO",
 	WARN:  "WARN",
+	FATAL: "FATAL",
 	ERROR: "ERROR",
 }
 
@@ -65,6 +68,11 @@ func (l *Logger) print(messageLevel LogLevel, format string, v ...interface{}) {
 
 func (l *Logger) Info(format string, v ...interface{}) {
 	l.print(INFO, format, v...)
+}
+
+func (l *Logger) Fatal(format string, v ...interface{}) {
+	l.print(FATAL, format, v...)
+	os.Exit(1)
 }
 
 func (l *Logger) Error(format string, v ...interface{}) {
