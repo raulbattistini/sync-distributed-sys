@@ -1,11 +1,10 @@
-// there should be a context for the requests - the code flows like fasthttp-ish, so it would make sense to have the code similarly wrote
-
 package coordinator
 
 import (
+	"context"
 	"fmt"
+	"go-rpc/internal/coordinator/storage"
 	"go-rpc/internal/util"
-	"net/rpc"
 	"sync"
 	"time"
 
@@ -13,54 +12,59 @@ import (
 	"go.bryk.io/pkg/ulid"
 )
 
-type Session struct {
-	ID         ulid.ULID
-	ClientID   string
-	ClientInfo rpc.Client
-	LastSeen   time.Time
-	HeldLocks  []string
-	CreatedAt  time.Time
-}
-
-type Lock struct {
-	Name      string
-	Owner     ulid.ULID
-	Token     string
-	ExpiresAt time.Time
-	Timer     *time.Timer
-}
-
 type Coordinator struct {
-	mu             sync.RWMutex
-	locks          map[string]*Lock
-	sessions       map[ulid.ULID]*Session
-	sessionTimeout time.Duration
+	mu sync.RWMutex
+	/*
+		locks          map[string]*Lock
+		sessions       map[ulid.ULID]*Session
+		metrics        metrics.Metrics
+	*/
 	sessionAfw     time.Duration
 	stopChan       chan struct{}
+	sessionTimeout time.Duration
+	storage        storage.Storage
+	logger         util.Logger
+	lockCache      map[string]*LockState
+	sessionCache   map[ulid.ULID]*SessionState
 }
 
-func NewCoordinator(sessionTimeout time.Duration) *Coordinator {
+type LockState struct {
+	Lock  *storage.Lock
+	Timer *time.Timer
+}
+
+type SessionState struct {
+	Session  *storage.Session
+	LastSeen time.Time
+}
+
+func NewCoordinator(store storage.Storage, sessionTimeout time.Duration) *Coordinator {
 	c := &Coordinator{
-		locks:          make(map[string]*Lock),
-		sessions:       make(map[ulid.ULID]*Session),
+		storage:        store,
 		sessionTimeout: sessionTimeout,
 		stopChan:       make(chan struct{}),
+		lockCache:      make(map[string]*LockState),
+		sessionCache:   make(map[ulid.ULID]*SessionState),
 	}
 	go c.cleanupAfws()
 	return c
 }
 
-func (c *Coordinator) RegisterSession(clientID string) (sessionID ulid.ULID, expiresAt time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Coordinator) RegisterSession(ctx context.Context, clientID string) (sessionID ulid.ULID, expiresAt time.Time, err error) {
+	if err := ctx.Err(); err != nil {
+		return ulid.ULID{}, time.Time{}, fmt.Errorf("request cancelled or timed out: %v", err)
+	}
 
-	sessionID, err := ulid.New()
+	if clientID == "" {
+		return ulid.ULID{}, time.Time{}, fmt.Errorf("client ID cannot be empty")
+	}
+
+	sessionID, err = ulid.New()
 	if err != nil {
-		return ulid.ULID{}, time.Time{}
+		return ulid.ULID{}, time.Time{}, fmt.Errorf("failed to generate session ID: %v", err)
 	}
 	expiresAt = time.Now().Add(c.sessionTimeout)
-
-	c.sessions[sessionID] = &Session{
+	session := &storage.Session{
 		ID:        sessionID,
 		ClientID:  clientID,
 		LastSeen:  time.Now(),
@@ -68,139 +72,246 @@ func (c *Coordinator) RegisterSession(clientID string) (sessionID ulid.ULID, exp
 		CreatedAt: time.Now(),
 	}
 
-	util.Log().Info("Session registered: %v (client: %s)", sessionID, clientID)
-
-	return sessionID, expiresAt
-}
-
-func (c *Coordinator) Heartbeat(sessionID ulid.ULID) (bool, time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	session, exists := c.sessions[sessionID]
-	if !exists {
-		return false, time.Time{}
+	if err := c.storage.SaveSession(ctx, session); err != nil {
+		return ulid.ULID{}, time.Time{}, fmt.Errorf("failed to save session to storage: %v", err)
 	}
 
-	session.LastSeen = time.Now()
-	expiresAt := session.LastSeen.Add(c.sessionTimeout)
+	c.mu.Lock()
+	c.sessionCache[sessionID] = &SessionState{
+		Session:  session,
+		LastSeen: time.Now(),
+	}
+	c.mu.Unlock()
 
-	return true, expiresAt
+	util.Log().Info("Session registered: %v (client: %s)", sessionID, clientID)
+
+	return sessionID, expiresAt, nil
 }
 
-func (c *Coordinator) AcquireLock(req AcquireLockRequest) AcquireLockResponse {
+func (c *Coordinator) Heartbeat(ctx context.Context, sessionID ulid.ULID) (bool, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return false, time.Time{}, fmt.Errorf("request cancelled or timed out: %v", err)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	session, exists := c.sessions[req.SessionID]
+	state, exists := c.sessionCache[sessionID]
 	if !exists {
+		session, err := c.storage.GetSession(ctx, sessionID.String())
+		if err != nil {
+			return false, time.Time{}, fmt.Errorf("session not found: %v", err)
+		}
+		state = &SessionState{
+			Session:  session,
+			LastSeen: time.Now(),
+		}
+		c.sessionCache[sessionID] = state
+	}
+
+	state.Session.LastSeen = time.Now()
+	expiresAt := state.Session.LastSeen.Add(c.sessionTimeout)
+	if err := c.storage.SaveSession(ctx, state.Session); err != nil {
+		return false, time.Time{}, fmt.Errorf("failed to update session in storage: %v", err)
+	}
+
+	return true, expiresAt, nil
+}
+
+func (c *Coordinator) AcquireLock(ctx context.Context, req AcquireLockRequest) (AcquireLockResponse, error) {
+	if err := ctx.Err(); err != nil {
 		return AcquireLockResponse{
 			Resp: GenericResponse{
 				Success: false,
-				Message: "This session wasn't found",
+				Message: fmt.Sprintf("Request cancelled or timed out: %v", err),
 			},
-		}
+		}, err
 	}
 
-	lock, lockExists := c.locks[req.LockName]
-	if lockExists {
-		if lock.Owner == req.SessionID {
-			return AcquireLockResponse{
-				Resp: GenericResponse{
-					Success: true,
-					Message: "Lock already held by the client",
-				},
-				Token:     lock.Token,
-				ExpiresAt: lock.ExpiresAt, // shouldnt the expires at be redefined here with a time add approach starting from now
-			}
-		}
-		if req.WaitTime > 0 { // time for the lock to be released by its owner before getting accessed
-			// should do a Futex.wake for this call for the 'sleeping' service to access this right after the lock is released by the first session
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sessionState, exists := c.sessionCache[req.SessionID]
+	if !exists {
+		session, err := c.storage.GetSession(ctx, req.SessionID.String())
+		if err != nil {
 			return AcquireLockResponse{
 				Resp: GenericResponse{
 					Success: false,
-					Message: fmt.Sprintf("Lock currently held by another client. Wait %T before trying again", req.WaitTime),
+					Message: "Session not found",
 				},
-			}
+			}, nil
 		}
-
+		sessionState = &SessionState{
+			Session:  session,
+			LastSeen: time.Now(),
+		}
+		c.sessionCache[req.SessionID] = sessionState
+	}
+	lockState, lExists := c.lockCache[req.LockName]
+	if !lExists {
+		fenceToken, err := c.storage.IncrementFenceCounter(ctx, req.LockName)
+		if err != nil {
+			return AcquireLockResponse{
+				Resp: GenericResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to increment fence counter: %v", err),
+				},
+			}, nil
+		}
+		lock, err := c.storage.GetLock(ctx, req.LockName)
+		lock.FenceToken = fenceToken
+		if err == nil {
+			lockState = &LockState{
+				Lock: lock,
+				Timer: time.AfterFunc(time.Until(lock.ExpiresAt), func() {
+					c.expireLock(req.LockName, lock.Token)
+				}),
+			}
+			c.lockCache[req.LockName] = lockState
+		}
+	}
+	if lExists && lockState.Lock.Owner != req.SessionID {
 		return AcquireLockResponse{
 			Resp: GenericResponse{
 				Success: false,
-				Message: "Lock being currently held",
+				Message: "Lock is already held by another session",
 			},
-		}
-
+		}, nil
+	}
+	if lExists && lockState.Lock.Owner == req.SessionID {
+		return AcquireLockResponse{
+			Resp: GenericResponse{
+				Success: true,
+				Message: "Lock already held by the session",
+			},
+			Token:      lockState.Lock.Token,
+			FenceToken: lockState.Lock.FenceToken,
+			ExpiresAt:  lockState.Lock.ExpiresAt,
+		}, nil
 	}
 
-	token := uuid.New().String()
-	expiresAt := time.Now().Add(req.Timeout) // do the request parse with criteria - ofc timeout <= max allowed
-
+	fenceToken, err := c.storage.IncrementFenceCounter(ctx, req.LockName)
+	if err != nil {
+		return AcquireLockResponse{
+			Resp: GenericResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to increment fence counter: %v", err),
+			},
+		}, nil
+	}
+	token, err := uuid.NewRandom()
+	if err != nil {
+		return AcquireLockResponse{
+			Resp: GenericResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to generate lock token: %v", err),
+			},
+		}, nil
+	}
+	expiresAt := time.Now().Add(req.Timeout)
+	createdAt := time.Now()
+	lock := &storage.Lock{
+		Name:       req.LockName,
+		Owner:      req.SessionID,
+		Token:      token.String(),
+		FenceToken: fenceToken,
+		ExpiresAt:  expiresAt,
+		CreatedAt:  createdAt,
+	}
+	if err := c.storage.SaveLock(ctx, lock); err != nil {
+		return AcquireLockResponse{
+			Resp: GenericResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to save lock to storage: %v", err),
+			},
+		}, nil
+	}
 	timer := time.AfterFunc(req.Timeout, func() {
-		c.expireLock(req.LockName, token)
+		c.expireLock(req.LockName, lock.Token)
 	})
-
-	c.locks[req.LockName] = &Lock{
-		Name:      req.LockName,
-		Owner:     req.SessionID,
-		Token:     token,
-		ExpiresAt: expiresAt,
-		Timer:     timer,
+	lockState = &LockState{
+		Lock:  lock,
+		Timer: timer,
 	}
 
-	session.HeldLocks = append(session.HeldLocks, req.LockName)
+	c.lockCache[req.LockName] = lockState
+	sessionState.Session.HeldLocks = append(sessionState.Session.HeldLocks, req.LockName)
 
-	util.Log().Info("Lock acquired: %s by session %v, expiring at %T")
-
+	if err := c.storage.SaveSession(ctx, sessionState.Session); err != nil {
+		return AcquireLockResponse{
+			Resp: GenericResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to update session in storage: %v", err),
+			},
+		}, nil
+	}
+	util.Log().Info("Lock %s acquired by session %v", req.LockName, req.SessionID)
 	return AcquireLockResponse{
 		Resp: GenericResponse{
 			Success: true,
 			Message: "Lock acquired successfully",
 		},
-		Token:     token,
-		ExpiresAt: expiresAt,
-	}
+		Token:      lock.Token,
+		FenceToken: lock.FenceToken,
+		ExpiresAt:  lock.ExpiresAt,
+	}, nil
 }
 
-func (c *Coordinator) ReleaseLock(req ReleaseLockRequest) ReleaseLockResponse {
+func (c *Coordinator) ReleaseLock(ctx context.Context, req ReleaseLockRequest) (ReleaseLockResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return ReleaseLockResponse{}, fmt.Errorf("request cancelled or timed out: %v", err)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	lock, exists := c.locks[req.LockName]
+	lock, exists := c.lockCache[req.LockName]
 	if !exists {
 		return ReleaseLockResponse{
 			Resp: GenericResponse{
 				Success: false,
 				Message: "Lock does not exists",
 			},
-		}
+		}, nil
 	}
 
-	if lock.Owner != req.SessionID {
+	if lock.Lock.Owner != req.SessionID {
 		return ReleaseLockResponse{
 			Resp: GenericResponse{
 				Success: false,
 				Message: "The client does not hold the lock",
 			},
-		}
+		}, nil
 	}
 
-	if lock.Token != req.Token {
+	if lock.Lock.Token != req.Token {
 		return ReleaseLockResponse{
 			Resp: GenericResponse{
 				Success: false,
 				Message: "Invalid token",
 			},
-		}
+		}, nil
 	}
 
 	lock.Timer.Stop()
-	delete(c.locks, req.LockName)
-	util.Log().Debug("Deleted the lock %s at %T", lock.Name, time.Now())
-
-	if session, exists := c.sessions[req.SessionID]; exists {
-		session.HeldLocks = util.RemoveStr(session.HeldLocks, lock.Name)
+	if err := c.storage.DeleteLock(ctx, req.LockName); err != nil {
+		return ReleaseLockResponse{
+			Resp: GenericResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to delete lock from storage: %v", err),
+			},
+		}, nil
 	}
+	delete(c.lockCache, req.LockName)
+
+	util.Log().Debug("Deleted the lock %s at %T", lock.Lock.Name, time.Now())
+
+	if sessionState, Sexists := c.sessionCache[req.SessionID]; Sexists {
+		sessionState.Session.HeldLocks = util.RemoveStr(sessionState.Session.HeldLocks, lock.Lock.Name)
+		c.storage.SaveSession(ctx, sessionState.Session)
+	}
+
 	util.Log().Debug("Lock %s released by session %v", req.LockName, req.SessionID)
 
 	return ReleaseLockResponse{
@@ -208,44 +319,51 @@ func (c *Coordinator) ReleaseLock(req ReleaseLockRequest) ReleaseLockResponse {
 			Success: true,
 			Message: "Lock released succesfully",
 		},
-	}
+	}, nil
 }
 
 func (c *Coordinator) expireLock(lockName, token string) {
+	ctx := context.Background()
+	if err := ctx.Err(); err != nil {
+		util.Log().Debug("Context error while expiring lock %s: %v", lockName, err)
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	lock, exists := c.locks[lockName]
-	if !exists {
+	lockState, lExists := c.lockCache[lockName]
+	if !lExists {
 		util.Log().Debug("Lock %s was already released", lockName)
 		return
 	}
-	if lock.Token != token {
-		util.Log().Debug("Provided token %s was different from lock's %s", token, lock.Token)
+	if lockState.Lock.Token != token {
+		util.Log().Debug("Provided token %s was different from lock's %s", token, lockState.Lock.Token)
 		return
 	}
 
-	util.Log().Info("Lock expired: %s was held by session %v", lockName, lock.Owner)
+	util.Log().Info("Lock expired: %s was held by session %v", lockName, lockState.Lock.Owner)
 
-	if session, exists := c.sessions[lock.Owner]; exists {
-		session.HeldLocks = util.RemoveStr(session.HeldLocks, lockName)
+	c.storage.DeleteLock(ctx, lockName)
+
+	delete(c.lockCache, lockName)
+
+	if session, Sexists := c.sessionCache[lockState.Lock.Owner]; Sexists {
+		session.Session.HeldLocks = util.RemoveStr(session.Session.HeldLocks, lockName)
+		c.storage.SaveSession(ctx, session.Session)
 	}
-
-	delete(c.locks, lockName)
 }
 
 func (c *Coordinator) cleanupAfws() {
 	ticker := time.NewTicker(c.sessionAfw)
 	defer ticker.Stop()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// looks like a gc stop the world approach running endlessly
-
 	for {
 		select {
 		case <-ticker.C:
+			util.Log().Debug("Starting afws session cleanup")
 			c.sessionCleanupProc()
+			util.Log().Debug("Completed afws session cleanup")
 		case <-c.stopChan:
 			// application graceful shutdown
 			return
@@ -254,47 +372,60 @@ func (c *Coordinator) cleanupAfws() {
 }
 
 func (c *Coordinator) sessionCleanupProc() {
+	ctx := context.Background()
+	if err := ctx.Err(); err != nil {
+		util.Log().Debug("Context error during afw session cleanup: %v", err)
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	staleSessionIds := make([]ulid.ULID, 0)
 
-	for sessionID, session := range c.sessions {
-		if now.Sub(session.LastSeen) > c.sessionTimeout {
+	for sessionID, state := range c.sessionCache {
+		if now.Sub(state.Session.LastSeen) > c.sessionTimeout {
 			staleSessionIds = append(staleSessionIds, sessionID)
 		}
 	}
 
 	for _, sessionID := range staleSessionIds {
-		session := c.sessions[sessionID]
+		state := c.sessionCache[sessionID]
 
 		util.Log().Info("Cleaning up afw session %v", sessionID)
 
-		for _, lockName := range session.HeldLocks {
-			if lock, exists := c.locks[lockName]; exists {
-				lock.Timer.Stop() // as to avoid side effects on later phases
-				delete(c.locks, lockName)
+		for _, lockName := range state.Session.HeldLocks {
+			if lockState, lExists := c.lockCache[lockName]; lExists {
+				lockState.Timer.Stop() // as to avoid side effects on later phases
+				delete(c.lockCache, lockName)
 				util.Log().Info("Auto released lock %s from session %v (afw)", lockName, sessionID)
 			}
 		}
 
-		delete(c.sessions, sessionID)
+		c.storage.DeleteLock(ctx, sessionID.String())
+		delete(c.sessionCache, sessionID)
 	}
 }
 
 func (c *Coordinator) clearSessions() {
-	if len(c.sessions) > 0 {
-		for _, session := range c.sessions {
-			delete(c.sessions, session.ID)
+	if len(c.sessionCache) > 0 {
+		for _, state := range c.sessionCache {
+			c.mu.Lock()
+			delete(c.sessionCache, state.Session.ID)
+			c.storage.DeleteSession(context.Background(), state.Session.ID.String())
+			c.mu.Unlock()
 		}
 	}
 }
 
 func (c *Coordinator) clearLocks() {
-	if len(c.locks) > 0 {
-		for _, lock := range c.locks {
-			delete(c.locks, lock.Name)
+	if len(c.lockCache) > 0 {
+		for _, lockState := range c.lockCache {
+			c.mu.Lock()
+			lockState.Timer.Stop()
+			c.storage.DeleteLock(context.Background(), lockState.Lock.Name)
+			delete(c.lockCache, lockState.Lock.Name)
+			c.mu.Unlock()
 		}
 	}
 }
@@ -305,21 +436,8 @@ func (c *Coordinator) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, lock := range c.locks {
-		// nested, can be improved
-		lock.Timer.Stop()
-		// also avoids side effects
+	for len(c.lockCache) > 0 || len(c.sessionCache) > 0 {
 		c.clearLocks()
 		c.clearSessions()
-	}
-}
-
-func (c *Coordinator) GetStats() StatsServer {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return StatsServer{
-		ActiveSessions: len(c.sessions),
-		ActiveLocks:    len(c.locks),
 	}
 }

@@ -22,9 +22,11 @@ type AcquireLockRequest struct {
 }
 
 type AcquireLockResponse struct {
-	Resp      GenericResponse
-	Token     string // meant to work like an api key
-	ExpiresAt time.Time
+	Resp       GenericResponse
+	Token      string // meant to work like an api key
+	FenceToken uint64
+	ExpiresAt  time.Time
+	CreatedAt  time.Time
 }
 
 type ReleaseLockRequest struct {
