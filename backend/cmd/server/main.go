@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"go-rpc/configs"
@@ -24,6 +24,7 @@ func main() {
 
 	coordTimeout := time.Duration(parsedCfgServer.SessionTimeoutSeconds) * time.Second
 
+	// TODO: fit context aware coordinator
 	coord := coordinator.NewCoordinator(coordTimeout)
 	defer coord.Stop()
 
